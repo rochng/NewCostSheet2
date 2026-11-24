@@ -1,0 +1,444 @@
+USE GarmentCostingDB;
+GO
+
+IF OBJECT_ID(N'dbo.usp_CostSheet_Create', N'P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_CostSheet_Create;
+GO
+
+CREATE PROCEDURE dbo.usp_CostSheet_Create
+    @Vendor varchar(100),
+    @Buyer varchar(100),
+    @Season varchar(50),
+    @SeasonYear varchar(10),
+    @Stage varchar(100),
+    @PDStyle varchar(50),
+    @Style varchar(100),
+    @RevisionNumber int,
+    @RecordStatus varchar(30),
+    @Currency varchar(10),
+    @RoyaltyRate decimal(18,6),
+    @Notes varchar(2000) = NULL,
+    @CreatedBy varchar(30),
+    @LinesJson nvarchar(max) = N'[]',
+    @OriginalCostSheetId int = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF @LinesJson IS NULL OR ISJSON(@LinesJson) <> 1
+        THROW 50001, 'LinesJson must be a valid JSON array.', 1;
+
+    IF LEFT(LTRIM(@LinesJson), 1) <> N'['
+        THROW 50002, 'LinesJson must be a JSON array.', 1;
+
+    IF NULLIF(LTRIM(RTRIM(@RecordStatus)), '') IS NULL
+        THROW 50004, 'RecordStatus is required.', 1;
+
+    DECLARE @RevisionGroupId int;
+    DECLARE @CostSheetId int;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        IF @OriginalCostSheetId IS NOT NULL
+        BEGIN
+            SELECT @RevisionGroupId = RevisionGroupId
+            FROM dbo.CostSheet WITH (UPDLOCK, HOLDLOCK)
+            WHERE CostSheetId = @OriginalCostSheetId
+              AND IsDeleted = 0;
+
+            IF @RevisionGroupId IS NULL
+                THROW 50003, 'The source cost sheet does not exist or is deleted.', 1;
+
+            SELECT @RevisionNumber = ISNULL(MAX(RevisionNumber), 0) + 1
+            FROM dbo.CostSheet WITH (UPDLOCK, HOLDLOCK)
+            WHERE RevisionGroupId = @RevisionGroupId
+              AND IsDeleted = 0;
+        END
+        ELSE
+        BEGIN
+            INSERT INTO dbo.CostSheetRevisionGroup (OriginalCostSheetId, CreatedBy)
+            VALUES (NULL, @CreatedBy);
+
+            SET @RevisionGroupId = CONVERT(int, SCOPE_IDENTITY());
+        END
+
+        IF EXISTS (
+            SELECT 1
+            FROM dbo.CostSheet WITH (UPDLOCK, HOLDLOCK)
+            WHERE IsDeleted = 0
+              AND Vendor = @Vendor
+              AND Buyer = @Buyer
+              AND PDStyle = @PDStyle
+              AND Style = @Style
+              AND Season = @Season
+              AND SeasonYear = @SeasonYear
+              AND Stage = @Stage
+              AND RevisionNumber = @RevisionNumber
+        )
+            THROW 50005, 'A cost sheet already exists with this vendor, buyer, style, season, stage, and revision.', 1;
+
+        INSERT INTO dbo.CostSheet (
+            RevisionGroupId, Vendor, Buyer, Season, SeasonYear, Stage, PDStyle, Style,
+            RevisionNumber, RecordStatus, Currency, RoyaltyRate, Notes, CreatedBy, ModifiedBy
+        )
+        VALUES (
+            @RevisionGroupId, @Vendor, @Buyer, @Season, @SeasonYear, @Stage, @PDStyle, @Style,
+            @RevisionNumber, @RecordStatus, @Currency, @RoyaltyRate, @Notes, @CreatedBy, @CreatedBy
+        );
+
+        SET @CostSheetId = CONVERT(int, SCOPE_IDENTITY());
+
+        INSERT INTO dbo.CostSheetLine (
+            CostSheetId, SectionCode, CategoryCode, CategoryName, ItemName, Description,
+            ArticleNumber, Supplier, Quantity, QuantityUnit, UnitPrice,
+            CalculatedAmount, Notes, DisplayOrder, CreatedBy, ModifiedBy
+        )
+        SELECT
+            @CostSheetId, SectionCode, CategoryCode, CategoryName, ItemName, Description,
+            ArticleNumber, Supplier, Quantity, QuantityUnit, UnitPrice,
+            CalculatedAmount, Notes, DisplayOrder, @CreatedBy, @CreatedBy
+        FROM OPENJSON(@LinesJson)
+        WITH (
+            SectionCode varchar(10) '$.sectionCode',
+            CategoryCode varchar(50) '$.categoryCode',
+            CategoryName varchar(200) '$.categoryName',
+            ItemName varchar(200) '$.itemName',
+            Description varchar(500) '$.description',
+            ArticleNumber varchar(100) '$.articleNumber',
+            Supplier varchar(200) '$.supplier',
+            Quantity decimal(18,6) '$.quantity',
+            QuantityUnit varchar(30) '$.quantityUnit',
+            UnitPrice decimal(18,6) '$.unitPrice',
+            CalculatedAmount decimal(18,6) '$.calculatedAmount',
+            Notes varchar(500) '$.notes',
+            DisplayOrder int '$.displayOrder'
+        );
+
+        INSERT INTO dbo.CostSheetAudit (CostSheetId, RevisionId, ActionType, ActionBy)
+        VALUES (@CostSheetId, @RevisionNumber, 'CREATE', @CreatedBy);
+
+        COMMIT TRANSACTION;
+        SELECT @CostSheetId AS CostSheetId, @RevisionNumber AS RevisionNumber;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0
+            ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END
+GO
+
+IF OBJECT_ID(N'dbo.usp_CostSheet_GetForPrint', N'P') IS NOT NULL
+        DROP PROCEDURE dbo.usp_CostSheet_GetForPrint;
+GO
+
+CREATE PROCEDURE dbo.usp_CostSheet_GetForPrint
+        @CostSheetId int
+AS
+BEGIN
+        SET NOCOUNT ON;
+
+        SELECT sheet.CostSheetId AS Id,
+               sheet.Vendor,
+               COALESCE(NULLIF(LTRIM(RTRIM(vendorMaster.Vendor_Name)), ''), sheet.Vendor) AS VendorName,
+               sheet.Buyer,
+               COALESCE(NULLIF(LTRIM(RTRIM(buyerMaster.[name])), ''), sheet.Buyer) AS BuyerName,
+               sheet.Season, sheet.SeasonYear, sheet.Stage, sheet.PDStyle, sheet.Style,
+               sheet.RevisionNumber, sheet.RecordStatus, sheet.Currency, sheet.RoyaltyRate,
+               sheet.Notes, sheet.CreatedBy, sheet.CreatedDate, sheet.ModifiedBy, sheet.ModifiedDate
+        FROM dbo.CostSheet AS sheet
+        OUTER APPLY (
+            SELECT TOP (1) Vendor_Name
+            FROM dbo.Vendor
+            WHERE Vendor_code = sheet.Vendor OR Vendor_Name = sheet.Vendor
+            ORDER BY CASE WHEN Vendor_code = sheet.Vendor THEN 0 ELSE 1 END
+        ) AS vendorMaster
+        OUTER APPLY (
+            SELECT TOP (1) [name]
+            FROM ERPII.dbo.company
+            WHERE company = sheet.Buyer AND IsBuyer = 1 AND edi = 1 AND st_status = 5614
+        ) AS buyerMaster
+        WHERE sheet.CostSheetId = @CostSheetId
+          AND sheet.IsDeleted = 0;
+
+        SELECT CostSheetLineId AS Id, CostSheetId, SectionCode, CategoryCode, CategoryName, ItemName,
+                 Description, ArticleNumber, Supplier, Quantity, QuantityUnit, UnitPrice, QuantityUnit AS PriceUnit,
+                     CalculatedAmount, Notes, DisplayOrder
+        FROM dbo.CostSheetLine
+        WHERE CostSheetId = @CostSheetId
+            AND IsDeleted = 0
+        ORDER BY DisplayOrder, CostSheetLineId;
+END
+GO
+
+IF OBJECT_ID(N'dbo.usp_CostSheet_Update', N'P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_CostSheet_Update;
+GO
+
+CREATE PROCEDURE dbo.usp_CostSheet_Update
+    @CostSheetId int,
+    @Vendor varchar(100),
+    @Buyer varchar(100),
+    @Season varchar(50),
+    @SeasonYear varchar(10),
+    @Stage varchar(100),
+    @PDStyle varchar(50),
+    @Style varchar(100),
+    @RevisionNumber int,
+    @RecordStatus varchar(30),
+    @Currency varchar(10),
+    @RoyaltyRate decimal(18,6),
+    @Notes varchar(2000) = NULL,
+    @ModifiedBy varchar(30),
+    @LinesJson nvarchar(max) = N'[]'
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF @LinesJson IS NULL OR ISJSON(@LinesJson) <> 1
+        THROW 50011, 'LinesJson must be a valid JSON array.', 1;
+
+    IF LEFT(LTRIM(@LinesJson), 1) <> N'['
+        THROW 50012, 'LinesJson must be a JSON array.', 1;
+
+    IF NULLIF(LTRIM(RTRIM(@RecordStatus)), '') IS NULL
+        THROW 50016, 'RecordStatus is required.', 1;
+
+    DECLARE @UpdatedRows int;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        IF EXISTS (
+            SELECT 1
+            FROM dbo.CostSheet AS currentSheet
+            WHERE currentSheet.CostSheetId = @CostSheetId
+              AND (
+                  currentSheet.Vendor <> @Vendor
+                  OR currentSheet.Buyer <> @Buyer
+                  OR currentSheet.PDStyle <> @PDStyle
+                  OR currentSheet.Style <> @Style
+                  OR currentSheet.Season <> @Season
+                  OR currentSheet.SeasonYear <> @SeasonYear
+                  OR currentSheet.Stage <> @Stage
+                  OR currentSheet.RevisionNumber <> @RevisionNumber
+              )
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM dbo.CostSheet AS duplicate WITH (UPDLOCK, HOLDLOCK)
+            WHERE duplicate.CostSheetId <> @CostSheetId
+              AND duplicate.IsDeleted = 0
+              AND duplicate.Vendor = @Vendor
+              AND duplicate.Buyer = @Buyer
+              AND duplicate.PDStyle = @PDStyle
+              AND duplicate.Style = @Style
+              AND duplicate.Season = @Season
+              AND duplicate.SeasonYear = @SeasonYear
+              AND duplicate.Stage = @Stage
+              AND duplicate.RevisionNumber = @RevisionNumber
+        )
+            THROW 50017, 'Another cost sheet already exists with this vendor, buyer, style, season, stage, and revision.', 1;
+
+        UPDATE dbo.CostSheet
+        SET Vendor = @Vendor,
+            Buyer = @Buyer,
+            Season = @Season,
+            SeasonYear = @SeasonYear,
+            Stage = @Stage,
+            PDStyle = @PDStyle,
+            Style = @Style,
+            RevisionNumber = @RevisionNumber,
+            RecordStatus = @RecordStatus,
+            Currency = @Currency,
+            RoyaltyRate = @RoyaltyRate,
+            Notes = @Notes,
+            ModifiedBy = @ModifiedBy,
+            ModifiedDate = GETDATE()
+        WHERE CostSheetId = @CostSheetId
+          AND IsDeleted = 0;
+
+        SET @UpdatedRows = @@ROWCOUNT;
+        IF @UpdatedRows = 0
+            THROW 50013, 'The cost sheet does not exist or is deleted.', 1;
+
+        CREATE TABLE #IncomingLines (
+            LineId int NULL,
+            SectionCode varchar(10) NULL,
+            CategoryCode varchar(50) NULL,
+            CategoryName varchar(200) NULL,
+            ItemName varchar(200) NULL,
+            Description varchar(500) NULL,
+            ArticleNumber varchar(100) NULL,
+            Supplier varchar(200) NULL,
+            Quantity decimal(18,6) NULL,
+            QuantityUnit varchar(30) NULL,
+            UnitPrice decimal(18,6) NULL,
+            CalculatedAmount decimal(18,6) NULL,
+            Notes varchar(500) NULL,
+            DisplayOrder int NULL
+        );
+
+        INSERT INTO #IncomingLines (
+            LineId, SectionCode, CategoryCode, CategoryName, ItemName, Description,
+            ArticleNumber, Supplier, Quantity, QuantityUnit, UnitPrice,
+            CalculatedAmount, Notes, DisplayOrder
+        )
+        SELECT
+            NULLIF(LineId, 0), SectionCode, CategoryCode, CategoryName, ItemName, Description,
+            ArticleNumber, Supplier, Quantity, QuantityUnit, UnitPrice,
+            CalculatedAmount, Notes, DisplayOrder
+        FROM OPENJSON(@LinesJson)
+        WITH (
+            LineId int '$.id',
+            SectionCode varchar(10) '$.sectionCode',
+            CategoryCode varchar(50) '$.categoryCode',
+            CategoryName varchar(200) '$.categoryName',
+            ItemName varchar(200) '$.itemName',
+            Description varchar(500) '$.description',
+            ArticleNumber varchar(100) '$.articleNumber',
+            Supplier varchar(200) '$.supplier',
+            Quantity decimal(18,6) '$.quantity',
+            QuantityUnit varchar(30) '$.quantityUnit',
+            UnitPrice decimal(18,6) '$.unitPrice',
+            CalculatedAmount decimal(18,6) '$.calculatedAmount',
+            Notes varchar(500) '$.notes',
+            DisplayOrder int '$.displayOrder'
+        );
+
+        IF EXISTS (
+            SELECT LineId
+            FROM #IncomingLines
+            WHERE LineId IS NOT NULL
+            GROUP BY LineId
+            HAVING COUNT(*) > 1
+        )
+            THROW 50014, 'The submitted lines contain a duplicate line ID.', 1;
+
+        IF EXISTS (
+            SELECT 1
+            FROM #IncomingLines AS incoming
+            LEFT JOIN dbo.CostSheetLine AS existing
+              ON existing.CostSheetLineId = incoming.LineId
+             AND existing.CostSheetId = @CostSheetId
+            WHERE incoming.LineId IS NOT NULL
+              AND existing.CostSheetLineId IS NULL
+        )
+            THROW 50015, 'A submitted line ID does not belong to this cost sheet.', 1;
+
+        UPDATE existing
+        SET SectionCode = incoming.SectionCode,
+            CategoryCode = incoming.CategoryCode,
+            CategoryName = incoming.CategoryName,
+            ItemName = incoming.ItemName,
+            Description = incoming.Description,
+            ArticleNumber = incoming.ArticleNumber,
+            Supplier = incoming.Supplier,
+            Quantity = incoming.Quantity,
+            QuantityUnit = incoming.QuantityUnit,
+            UnitPrice = incoming.UnitPrice,
+            PriceUnit = NULL,
+            CalculatedAmount = incoming.CalculatedAmount,
+            Notes = incoming.Notes,
+            DisplayOrder = incoming.DisplayOrder,
+            IsDeleted = 0,
+            ModifiedBy = @ModifiedBy,
+            ModifiedDate = GETDATE()
+        FROM dbo.CostSheetLine AS existing
+        INNER JOIN #IncomingLines AS incoming
+          ON incoming.LineId = existing.CostSheetLineId
+        WHERE existing.CostSheetId = @CostSheetId;
+
+        UPDATE existing
+        SET IsDeleted = 1,
+            ModifiedBy = @ModifiedBy,
+            ModifiedDate = GETDATE()
+        FROM dbo.CostSheetLine AS existing
+        WHERE existing.CostSheetId = @CostSheetId
+          AND existing.IsDeleted = 0
+          AND NOT EXISTS (
+              SELECT 1
+              FROM #IncomingLines AS incoming
+              WHERE incoming.LineId = existing.CostSheetLineId
+          );
+
+        INSERT INTO dbo.CostSheetLine (
+            CostSheetId, SectionCode, CategoryCode, CategoryName, ItemName, Description,
+            ArticleNumber, Supplier, Quantity, QuantityUnit, UnitPrice,
+            CalculatedAmount, Notes, DisplayOrder, CreatedBy, ModifiedBy
+        )
+        SELECT
+            @CostSheetId, SectionCode, CategoryCode, CategoryName, ItemName, Description,
+            ArticleNumber, Supplier, Quantity, QuantityUnit, UnitPrice,
+            CalculatedAmount, Notes, DisplayOrder, @ModifiedBy, @ModifiedBy
+        FROM #IncomingLines
+        WHERE LineId IS NULL;
+
+        INSERT INTO dbo.CostSheetAudit (CostSheetId, RevisionId, ActionType, ActionBy)
+        VALUES (@CostSheetId, @RevisionNumber, 'UPDATE', @ModifiedBy);
+
+        COMMIT TRANSACTION;
+        SELECT @CostSheetId AS CostSheetId, @RevisionNumber AS RevisionNumber;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0
+            ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END
+GO
+
+IF OBJECT_ID(N'dbo.usp_CostSheet_Delete', N'P') IS NOT NULL
+    DROP PROCEDURE dbo.usp_CostSheet_Delete;
+GO
+
+CREATE PROCEDURE dbo.usp_CostSheet_Delete
+    @CostSheetId int,
+    @DeletedBy varchar(30)
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @RevisionNumber int;
+
+    BEGIN TRY
+        BEGIN TRANSACTION;
+
+        SELECT @RevisionNumber = RevisionNumber
+        FROM dbo.CostSheet WITH (UPDLOCK, HOLDLOCK)
+        WHERE CostSheetId = @CostSheetId
+          AND IsDeleted = 0;
+
+        IF @RevisionNumber IS NULL
+            THROW 50018, 'The cost sheet does not exist or is already deleted.', 1;
+
+        UPDATE dbo.CostSheet
+        SET IsDeleted = 1,
+            ModifiedBy = @DeletedBy,
+            ModifiedDate = GETDATE()
+        WHERE CostSheetId = @CostSheetId
+          AND IsDeleted = 0;
+
+        UPDATE dbo.CostSheetLine
+        SET IsDeleted = 1,
+            ModifiedBy = @DeletedBy,
+            ModifiedDate = GETDATE()
+        WHERE CostSheetId = @CostSheetId
+          AND IsDeleted = 0;
+
+        INSERT INTO dbo.CostSheetAudit (CostSheetId, RevisionId, ActionType, ActionBy)
+        VALUES (@CostSheetId, @RevisionNumber, 'DELETE', @DeletedBy);
+
+        COMMIT TRANSACTION;
+    END TRY
+    BEGIN CATCH
+        IF XACT_STATE() <> 0
+            ROLLBACK TRANSACTION;
+        THROW;
+    END CATCH
+END
+GO

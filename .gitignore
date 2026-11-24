@@ -1,0 +1,12 @@
+# 排除前端依賴套件與編譯產物（檔案太大，GitHub 推不上去）
+node_modules/
+dist/
+
+# 排除 C# 後端編譯產物與暫存檔
+bin/
+obj/
+.vs/
+
+# 排除包含資料庫密碼的正式環境設定檔（資安保護！）
+appsettings.Production.json
+.env.production
